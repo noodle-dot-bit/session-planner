@@ -16,9 +16,11 @@ bot = discord.Bot()
 
 @bot.event
 async def on_ready():
+    # Register the persistent view on startup so it survives reboots
+    bot.add_view(NormalView())
     print(f"{bot.user} is ready and online!")
 
-# --- HELPER FUNCTION ---
+# --- HELPER FUNCTIONS ---
 def generate_session_embed(session_data) -> discord.Embed:
     if not session_data:
         session_data = {}
@@ -58,6 +60,13 @@ def generate_session_embed(session_data) -> discord.Embed:
     embed.set_footer(text="Last Edit")
     return embed
 
+def get_configured_normal_view(message_id: int):
+    """Helper to generate the view with the correct button colors/labels based on the database."""
+    session_data = db.get(query.message_id == message_id)
+    is_confirmed = session_data.get("confirmed", False) if session_data and not isinstance(session_data, list) else False
+    return NormalView().configure_buttons(is_confirmed)
+
+
 # --- MODALS & VIEWS ---
 class SingleEditModal(discord.ui.Modal):
     def __init__(self, message_id: int, field_name: str, current_value: str):
@@ -84,7 +93,8 @@ class SingleEditModal(discord.ui.Modal):
         updated_data = dict(raw_data) if raw_data and not isinstance(raw_data, list) else {}
         new_embed = generate_session_embed(updated_data) 
 
-        await interaction.response.edit_message(embed=new_embed, view=NormalView(self.message_id))
+        # Use the helper function to build the view safely
+        await interaction.response.edit_message(embed=new_embed, view=get_configured_normal_view(self.message_id))
         await interaction.followup.send(f"Successfully updated the {self.field_name}!", ephemeral=True)
 
 
@@ -131,10 +141,9 @@ class EditDropdownView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️")
     async def cancel_button(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await interaction.response.edit_message(view=NormalView(self.message_id))
+        await interaction.response.edit_message(view=get_configured_normal_view(self.message_id))
 
 
-# NEW: The confirmation menu for deletions
 class ConfirmDeleteView(discord.ui.View):
     def __init__(self, message_id: int):
         super().__init__(timeout=None)
@@ -142,10 +151,8 @@ class ConfirmDeleteView(discord.ui.View):
 
     @discord.ui.button(label="Yes, Permanently Delete", style=discord.ButtonStyle.danger, emoji="⚠️")
     async def confirm_delete(self, button: discord.ui.Button, interaction: discord.Interaction):
-        # Scrub it from the database
         db.remove(query.message_id == self.message_id)
 
-        # Tombstone the message visually
         await interaction.response.edit_message(
             content="🗑️ **This session has been permanently deleted.**", 
             embed=None, 
@@ -154,27 +161,40 @@ class ConfirmDeleteView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="↩️")
     async def cancel_delete(self, button: discord.ui.Button, interaction: discord.Interaction):
-        # User canceled the deletion, return to the normal view
-        await interaction.response.edit_message(view=NormalView(self.message_id))
+        await interaction.response.edit_message(view=get_configured_normal_view(self.message_id))
 
 
 class NormalView(discord.ui.View):
-    def __init__(self, message_id: int):
-        super().__init__(timeout=None)
-        self.message_id = message_id
-        
-        session_data = db.get(query.message_id == self.message_id)
-        if session_data and not isinstance(session_data, list):
-            if session_data.get("confirmed", False):
-                first_button = self.children[0]
-                if isinstance(first_button, discord.ui.Button):
-                    first_button.label = "Cancel Confirmation"
-                    first_button.style = discord.ButtonStyle.danger
-                    first_button.emoji = "✖️"
+    def __init__(self):
+        super().__init__(timeout=None) # Required for persistent views
 
-    @discord.ui.button(label="Confirm Readiness", style=discord.ButtonStyle.success, emoji="✅")
+    def configure_buttons(self, is_confirmed: bool):
+        """Dynamically styles the first button based on database confirmation state."""
+        if not self.children:
+            return self
+            
+        first_button = self.children[0]
+        # PYLANCE FIX: Type checking the button before assigning attributes
+        if isinstance(first_button, discord.ui.Button):
+            if is_confirmed:
+                first_button.label = "Cancel Confirmation"
+                first_button.style = discord.ButtonStyle.danger
+                first_button.emoji = "✖️"
+            else:
+                first_button.label = "Confirm Readiness"
+                first_button.style = discord.ButtonStyle.success
+                first_button.emoji = "✅"
+        return self
+
+    @discord.ui.button(label="Confirm Readiness", style=discord.ButtonStyle.success, emoji="✅", custom_id="btn_persistent_ready")
     async def toggle_ready(self, button: discord.ui.Button, interaction: discord.Interaction):
-        session_data = db.get(query.message_id == self.message_id)
+        # PYLANCE FIX: Ensuring interaction.message exists
+        if not interaction.message:
+            await interaction.response.send_message("Error: Message not found.", ephemeral=True)
+            return
+            
+        message_id = interaction.message.id 
+        session_data = db.get(query.message_id == message_id)
         
         if not session_data or isinstance(session_data, list):
             await interaction.response.send_message("Session not found in the database.", ephemeral=True)
@@ -186,29 +206,31 @@ class NormalView(discord.ui.View):
 
         current_state = session_data.get("confirmed", False)
         new_state = not current_state  
-        db.update({"confirmed": new_state}, query.message_id == self.message_id)
+        db.update({"confirmed": new_state}, query.message_id == message_id)
 
         if new_state:
-            button.label = "Cancel Confirmation"
-            button.style = discord.ButtonStyle.danger
-            button.emoji = "✖️"
             response_msg = "You have confirmed you are ready!"
         else:
-            button.label = "Confirm Readiness"
-            button.style = discord.ButtonStyle.success
-            button.emoji = "✅"
             response_msg = "You have canceled your confirmation."
 
-        raw_data = db.get(query.message_id == self.message_id)
+        raw_data = db.get(query.message_id == message_id)
         updated_data = dict(raw_data) if raw_data and not isinstance(raw_data, list) else {}
-        new_embed = generate_session_embed(updated_data)
         
-        await interaction.response.edit_message(embed=new_embed, view=self)
+        new_embed = generate_session_embed(updated_data)
+        new_view = NormalView().configure_buttons(new_state)
+        
+        await interaction.response.edit_message(embed=new_embed, view=new_view)
         await interaction.followup.send(response_msg, ephemeral=True)
 
-    @discord.ui.button(label="Edit Session", style=discord.ButtonStyle.secondary, emoji="✏️")
+    @discord.ui.button(label="Edit Session", style=discord.ButtonStyle.secondary, emoji="✏️", custom_id="btn_persistent_edit")
     async def edit_session(self, button: discord.ui.Button, interaction: discord.Interaction):
-        session_data = db.get(query.message_id == self.message_id)
+        # PYLANCE FIX: Ensuring interaction.message exists
+        if not interaction.message:
+            await interaction.response.send_message("Error: Message not found.", ephemeral=True)
+            return
+            
+        message_id = interaction.message.id
+        session_data = db.get(query.message_id == message_id)
         
         if not session_data or isinstance(session_data, list):
             await interaction.response.send_message("Session not found in the database.", ephemeral=True)
@@ -219,11 +241,17 @@ class NormalView(discord.ui.View):
             await interaction.response.send_message("Only the person who scheduled this session can edit it!", ephemeral=True)
             return
 
-        await interaction.response.edit_message(view=EditDropdownView(self.message_id))
+        await interaction.response.edit_message(view=EditDropdownView(message_id))
 
-    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="btn_persistent_delete")
     async def delete_session_button(self, button: discord.ui.Button, interaction: discord.Interaction):
-        session_data = db.get(query.message_id == self.message_id)
+        # PYLANCE FIX: Ensuring interaction.message exists
+        if not interaction.message:
+            await interaction.response.send_message("Error: Message not found.", ephemeral=True)
+            return
+            
+        message_id = interaction.message.id
+        session_data = db.get(query.message_id == message_id)
         
         if not session_data or isinstance(session_data, list):
             await interaction.response.send_message("Session not found in the database.", ephemeral=True)
@@ -234,8 +262,7 @@ class NormalView(discord.ui.View):
             await interaction.response.send_message("Only the creator of this session can delete it!", ephemeral=True)
             return
 
-        # EDITED: Now swaps to the confirmation view instead of deleting instantly
-        await interaction.response.edit_message(view=ConfirmDeleteView(self.message_id))
+        await interaction.response.edit_message(view=ConfirmDeleteView(message_id))
 
 
 # --- COMMANDS ---
@@ -286,7 +313,8 @@ async def schedule(ctx, name: str = "Session", time: str = "None", agenda: str =
         "confirmed": False
     })
 
-    await msg.edit(view=NormalView(message_id=msg.id))
+    # Use the helper function so the button styles initialize properly
+    await msg.edit(view=get_configured_normal_view(msg.id))
 
 
 bot.run(os.getenv('TOKEN'))
